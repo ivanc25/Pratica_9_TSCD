@@ -1,0 +1,105 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  archetype:
+    runs-on: ubuntu-22.04
+    outputs:
+      group: ${{ steps.maven-coords.outputs.group }}
+      artifact: ${{ steps.maven-coords.outputs.artifact }}
+      version: ${{ steps.maven-coords.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Verify pom.xml exists
+        run: |
+          if [ -f pom.xml ]; then
+            echo "pom.xml found"
+          else
+            echo "Error: pom.xml not found."
+            exit 1
+          fi
+
+      - name: Extract Maven coordinates
+        id: maven-coords
+        run: |
+          GROUP=$(mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout)
+          ARTIFACT=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "group=${GROUP}" >> "$GITHUB_OUTPUT"
+          echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Extracted coordinates: ${GROUP}:${ARTIFACT}:${VERSION}"
+
+  build:
+    runs-on: ubuntu-22.04
+    needs: archetype
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Restore Maven dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-dependencies-${{ needs.archetype.outputs.artifact }}-${{ needs.archetype.outputs.version }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-dependencies-${{ needs.archetype.outputs.artifact }}-
+
+      - name: Build, test and package project
+        run: mvn clean compile test package verify
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.archetype.outputs.artifact }}-${{ needs.archetype.outputs.version }}-jar
+          path: target/*.jar
+
+      - name: Upload JaCoCo coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: target/site/jacoco/
+          if-no-files-found: warn
+
+  coverage-check:
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Download JaCoCo coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: jacoco-report
+          path: ./reports
+
+      - name: Verify code coverage threshold (80%)
+        run: |
+          THRESHOLD=80
+          COVERAGE=$(python3 -c "import xml.etree.ElementTree as ET; r=ET.parse('./reports/jacoco.xml').getroot(); c=next(x for x in r.findall('counter') if x.attrib['type']=='INSTRUCTION'); m,v=int(c.attrib['missed']),int(c.attrib['covered']); print(f'{(v/(m+v))*100:.2f}')")
+          echo "Measured instruction coverage: ${COVERAGE}%"
+          python3 -c "import sys; sys.exit(0 if float('${COVERAGE}') >= float('${THRESHOLD}') else 1)" || { echo "Coverage below threshold: ${COVERAGE}%"; exit 1; }
+          echo "Coverage meets the threshold: ${COVERAGE}%"
